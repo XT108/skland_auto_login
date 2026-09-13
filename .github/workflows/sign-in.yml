@@ -14,6 +14,9 @@ jobs:
       SKLAND_TOKEN: ${{ secrets.SKLAND_TOKEN }}
       SKLAND_TOKENS: ${{ secrets.SKLAND_TOKENS }}
       SKLAND_USERS_JSON: ${{ secrets.SKLAND_USERS_JSON }}
+      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+      DINGTALK_MODE: "github"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
