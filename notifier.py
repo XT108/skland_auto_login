@@ -1,12 +1,63 @@
 # notifier.py
+import base64
+import hashlib
+import hmac
 import httpx
 import logging
+import os
 import smtplib
+import time
+import urllib.parse
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Optional
 
 logger = logging.getLogger("notifier")
+
+
+def _apply_env_notify_config(notify_cfg: dict) -> None:
+    """把环境变量中的通知配置合并进 notify 节点（GitHub Actions 场景用）。
+
+    config.yaml 里显式填写的值优先，环境变量只做兜底，不会覆盖已有配置。
+    """
+    env_map = {
+        "dingtalk": {
+            "webhook_url": os.getenv("DINGTALK_WEBHOOK", "").strip(),
+            "secret": os.getenv("DINGTALK_SECRET", "").strip(),
+            "keyword": os.getenv("DINGTALK_KEYWORD", "").strip(),
+            "mode": os.getenv("DINGTALK_MODE", "").strip(),
+            "repo": os.getenv("DINGTALK_REPO", "").strip(),
+        },
+        "qmsg": {
+            "key": os.getenv("QMSG_KEY", "").strip(),
+        },
+        "onebot": {
+            "url": os.getenv("ONEBOT_URL", "").strip(),
+            "access_token": os.getenv("ONEBOT_ACCESS_TOKEN", "").strip(),
+        },
+        "wecom": {
+            "webhook_url": os.getenv("WECOM_WEBHOOK", "").strip(),
+        },
+        "serverchan": {
+            "send_key": os.getenv("SERVERCHAN_SEND_KEY", "").strip(),
+        },
+        "email": {
+            "smtp_host": os.getenv("EMAIL_SMTP_HOST", "").strip(),
+            "smtp_port": os.getenv("EMAIL_SMTP_PORT", "").strip(),
+            "username": os.getenv("EMAIL_USERNAME", "").strip(),
+            "password": os.getenv("EMAIL_PASSWORD", "").strip(),
+            "receiver": os.getenv("EMAIL_RECEIVER", "").strip(),
+        },
+    }
+
+    for section, pairs in env_map.items():
+        existing = notify_cfg.get(section)
+        if not isinstance(existing, dict):
+            existing = {}
+            notify_cfg[section] = existing
+        for key, value in pairs.items():
+            if value and not existing.get(key):
+                existing[key] = value
 
 
 class NotifierManager:
@@ -15,6 +66,16 @@ class NotifierManager:
     def __init__(self, config: dict):
         self.notifiers = []
         notify_cfg = config.get("notify", {})
+        if not isinstance(notify_cfg, dict):
+            notify_cfg = {}
+
+        # 环境变量兜底（GitHub Actions 没有 config.yaml 时全靠这里）
+        _apply_env_notify_config(notify_cfg)
+
+        # ---------- 钉钉群机器人 ----------
+        dingtalk_cfg = notify_cfg.get("dingtalk") or {}
+        if dingtalk_cfg.get("webhook_url"):
+            self.notifiers.append(DingTalkNotifier(dingtalk_cfg))
 
         # 兼容老版本的 qmsg_key 配置
         legacy_qmsg_key = config.get("qmsg_key")
@@ -64,6 +125,151 @@ class BaseNotifier:
 
     async def send(self, message: str) -> bool:
         raise NotImplementedError
+
+
+# ==================== 钉钉群机器人 ====================
+class DingTalkNotifier(BaseNotifier):
+    """钉钉群机器人推送。
+
+    支持两类群机器人（群设置 -> 智能群助手 里添加的机器人不同，用的接口格式也不同）：
+
+    mode="custom"（默认，推荐）
+        群内「自定义机器人」，走标准 text 消息，内容完全可控。
+        安全设置支持：自定义关键词（keyword）/ 加签（secret）/ IP 白名单（Actions 不适用）。
+
+    mode="github"
+        群内「GitHub 机器人」。它只认 GitHub 的 webhook 事件格式，普通 text 消息会返回
+        errcode 300001 "robot type do not match with the message"。
+        此模式会伪造一条 push 事件，需附带 X-GitHub-Event 请求头。
+    """
+
+    name = "钉钉"
+
+    def __init__(self, cfg: dict):
+        self.webhook_url = (cfg.get("webhook_url") or "").strip()
+        self.mode = (cfg.get("mode") or "custom").strip().lower()
+        self.secret = (cfg.get("secret") or "").strip()        # 加签密钥（SEC 开头），可选
+        self.keyword = (cfg.get("keyword") or "").strip()      # 自定义关键词，可选
+        self.at_mobiles = cfg.get("at_mobiles") or []
+        self.repo = (cfg.get("repo") or "XT108/skland_auto_login").strip()
+        self.sender_name = (cfg.get("sender_name") or "森空岛签到姬").strip()
+
+        if self.mode not in ("custom", "github"):
+            logger.warning(f"[钉钉] 未知 mode={self.mode!r}，已回退为 custom")
+            self.mode = "custom"
+
+    # ---------- 加签 ----------
+    def _signed_url(self) -> str:
+        """按钉钉规则对 URL 加签（仅在配置了 secret 时生效）。"""
+        if not self.secret:
+            return self.webhook_url
+        ts = str(round(time.time() * 1000))
+        string_to_sign = f"{ts}\n{self.secret}"
+        digest = hmac.new(self.secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(digest))
+        sep = "&" if "?" in self.webhook_url else "?"
+        return f"{self.webhook_url}{sep}timestamp={ts}&sign={sign}"
+
+    # ---------- 报文构造 ----------
+    def _build_payload(self, message: str, mode: str | None = None) -> tuple[dict, dict]:
+        """返回 (payload, extra_headers)。mode 为 None 时使用实例配置。"""
+        mode = (mode or self.mode).lower()
+        if mode == "github":
+            commit_id = hashlib.sha1(message.encode("utf-8")).hexdigest()
+            html_url = f"https://github.com/{self.repo}"
+            commit = {
+                "id": commit_id,
+                "message": message,
+                "url": html_url,
+                "author": {"name": self.sender_name, "email": "bot@users.noreply.github.com"},
+                "added": [],
+                "removed": [],
+                "modified": [],
+            }
+            payload = {
+                "ref": "refs/heads/main",
+                "before": "0" * 40,
+                "after": commit_id,
+                "repository": {
+                    "id": 0,
+                    "name": self.repo.split("/")[-1],
+                    "full_name": self.repo,
+                    "html_url": html_url,
+                    "description": "森空岛自动签到",
+                    "default_branch": "main",
+                },
+                "pusher": {"name": self.sender_name, "email": "bot@users.noreply.github.com"},
+                "sender": {"login": self.sender_name, "id": 0},
+                "commits": [commit],
+                "head_commit": commit,
+            }
+            headers = {
+                "X-GitHub-Event": "push",
+                "X-GitHub-Delivery": commit_id[:32],
+                "X-GitHub-Hook-ID": "1",
+            }
+            return payload, headers
+
+        content = message
+        if self.keyword and self.keyword not in content:
+            # 机器人若启用了「自定义关键词」校验，正文必须包含该关键词
+            content = f"{self.keyword}\n{content}"
+
+        payload = {"msgtype": "text", "text": {"content": content}}
+        if self.at_mobiles:
+            payload["at"] = {"atMobiles": list(self.at_mobiles), "isAtAll": False}
+        return payload, {}
+
+    async def send(self, message: str) -> bool:
+        ok, result = await self._post(message, self.mode)
+
+        # 自愈：机器人类型与消息格式不匹配时，换另一种格式重试一次
+        # （custom <-> github 互切；失败的请求不会产生群消息，重试是安全的）
+        if not ok and result.get("errcode") == 300001:
+            other = "github" if self.mode != "github" else "custom"
+            logger.warning(
+                f"[钉钉] 当前 mode={self.mode} 与机器人类型不匹配（300001），"
+                f"自动改用 mode={other} 重试一次"
+            )
+            ok, result = await self._post(message, other)
+            if ok:
+                logger.warning(
+                    f"[钉钉] 重试成功。建议把配置里的 mode 固定为 {other}，省掉这次多余的握手。"
+                )
+
+        if ok:
+            logger.info(f"[钉钉] 推送成功（mode={self.mode}）")
+            return True
+
+        errcode = result.get("errcode")
+        logger.error(f"[钉钉] 推送失败: errcode={errcode} errmsg={result.get('errmsg')}")
+        if errcode == 300001:
+            logger.error(
+                "[钉钉] 300001 说明机器人类型与消息格式不匹配："
+                "若你用普通 text 消息却被拒，说明该 webhook 属于「GitHub 机器人」，"
+                "请把 mode 设为 github，或改用群内「自定义机器人」的 webhook。"
+            )
+        elif errcode == 310000:
+            logger.error("[钉钉] 310000 多为安全设置不通过：关键词未命中、加签密钥缺失或错误。")
+        elif errcode in (300005, 300006):
+            logger.error("[钉钉] 请确认 webhook 的 access_token 是否正确、机器人是否已被移出群。")
+        return False
+
+    async def _post(self, message: str, mode: str) -> tuple[bool, dict]:
+        """按指定 mode 发一次请求，返回 (是否成功, 响应体)。"""
+        payload, extra_headers = self._build_payload(message, mode)
+        headers = {"Content-Type": "application/json;charset=utf-8"}
+        headers.update(extra_headers)
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(self._signed_url(), json=payload, headers=headers)
+                result = resp.json()
+        except Exception as e:
+            logger.error(f"[钉钉] 推送异常: {e}")
+            return False, {"errcode": -1, "errmsg": str(e)}
+
+        return result.get("errcode") == 0, result
 
 
 # ==================== Qmsg 酱 ====================
